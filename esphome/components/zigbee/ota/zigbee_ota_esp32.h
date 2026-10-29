@@ -64,7 +64,7 @@ class ZigbeeOTAComponent : public ota::OTAComponent, public ZigbeeOTAListener, p
 #endif
 
   uint8_t endpoint_{1};
-  uint8_t block_size_{223};
+  uint8_t block_size_{50};
   uint32_t file_version_{0};
   uint16_t manufacturer_code_{0};
   uint16_t image_type_{0};

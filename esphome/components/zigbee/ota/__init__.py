@@ -55,8 +55,11 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_FILE_VERSION): cv.hex_uint32_t,
             # Defaults to the first endpoint.
             cv.Optional(CONF_ENDPOINT): cv.int_range(min=1, max=240),
-            # Largest block the client asks for; the server may send less.
-            cv.Optional(CONF_BLOCK_SIZE, default=223): cv.int_range(min=16, max=254),
+            # Largest block the client asks for; the server may send less. A
+            # block response carries ~17 bytes of headers on top of the data and
+            # must fit one Zigbee frame (less room on a routed or secured path):
+            # 64 data bytes never arrived on a router behind Zigbee2MQTT, 50 did.
+            cv.Optional(CONF_BLOCK_SIZE, default=50): cv.int_range(min=16, max=254),
             # zlib-compress the image in the OTA file (about 60 % of the size).
             cv.Optional(CONF_COMPRESS, default=True): cv.boolean,
             # A new image is confirmed only once the OTA server answers (Query
