@@ -115,8 +115,10 @@ float SafeModeComponent::get_setup_priority() const { return setup_priority::AFT
 
 #ifdef USE_OTA_ROLLBACK
 void SafeModeComponent::confirm_app_image_() {
-  // Mark the running app image as valid so the bootloader will not roll back
-  // to the previously flashed image
+  if (this->app_confirmation_held_)
+    return;
+    // Mark the running app image as valid so the bootloader will not roll back
+    // to the previously flashed image
 #if defined(USE_ZEPHYR)
   if (!boot_is_img_confirmed()) {
     boot_write_img_confirmed();
@@ -130,6 +132,14 @@ void SafeModeComponent::confirm_app_image_() {
     esp_ota_mark_app_valid_cancel_rollback();
   }
 #endif
+}
+#endif
+
+#ifdef USE_OTA_ROLLBACK
+void SafeModeComponent::release_app_confirmation() {
+  this->app_confirmation_held_ = false;
+  if (this->boot_successful_)
+    this->confirm_app_image_();
 }
 #endif
 

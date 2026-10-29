@@ -33,6 +33,7 @@ CONF_IMAGE_TYPE = "image_type"
 CONF_FILE_VERSION = "file_version"
 CONF_BLOCK_SIZE = "block_size"
 CONF_COMPRESS = "compress"
+CONF_CONFIRM_TIMEOUT = "confirm_timeout"
 
 OTA_FILE_NAME = "firmware.zigbee.ota"
 PACKER_SCRIPT = "make_zigbee_ota.py"
@@ -58,6 +59,12 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_BLOCK_SIZE, default=223): cv.int_range(min=16, max=254),
             # zlib-compress the image in the OTA file (about 60 % of the size).
             cv.Optional(CONF_COMPRESS, default=True): cv.boolean,
+            # A new image is confirmed only once the OTA server answers (Query
+            # Next Image); without an answer in this time the bootloader rolls
+            # back to the previous image. 0s leaves it to safe_mode alone.
+            cv.Optional(
+                CONF_CONFIRM_TIMEOUT, default="10min"
+            ): cv.positive_time_period_milliseconds,
         }
     )
     .extend(BASE_OTA_SCHEMA)
@@ -80,6 +87,13 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_endpoint(endpoint))
     cg.add(var.set_block_size(config[CONF_BLOCK_SIZE]))
     cg.add(var.set_file_version(file_version))
+    cg.add(var.set_manufacturer_code(config[CONF_MANUFACTURER_CODE]))
+    cg.add(var.set_image_type(config[CONF_IMAGE_TYPE]))
+    safe_mode_conf = CORE.config.get("safe_mode") or {}
+    if config[CONF_CONFIRM_TIMEOUT] and CONF_ID in safe_mode_conf:
+        cg.add_define("USE_ZIGBEE_OTA_CONFIRM")
+        cg.add(var.set_safe_mode(await cg.get_variable(safe_mode_conf[CONF_ID])))
+        cg.add(var.set_confirm_timeout(config[CONF_CONFIRM_TIMEOUT]))
     CORE.add_job(
         _add_cluster,
         zb,

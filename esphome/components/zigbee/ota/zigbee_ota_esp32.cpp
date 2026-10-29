@@ -39,9 +39,23 @@ static constexpr uint32_t REBOOT_DELAY_MIN_MS = 2000;
 static constexpr uint32_t REBOOT_DELAY_MAX_S = 86400;
 // Out-of-place blocks in a row tolerated before giving up.
 static constexpr uint8_t MAX_RESYNCS = 50;
+// While a new image waits for confirmation, ask the server this often.
+static constexpr uint32_t CONFIRM_QUERY_MS = 30000;
 
 void ZigbeeOTAComponent::setup() {
   this->parent_->set_ota_listener(this);
+#ifdef USE_ZIGBEE_OTA_CONFIRM
+  esp_ota_img_states_t state;
+  if (this->safe_mode_ != nullptr && this->confirm_timeout_ms_ > 0 &&
+      esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+      state == ESP_OTA_IMG_PENDING_VERIFY) {
+    this->safe_mode_->hold_app_confirmation();
+    this->pending_confirm_ = true;
+    this->boot_ms_ = millis();
+    ESP_LOGI(TAG, "New image, confirmed once the OTA server answers (rollback after %" PRIu32 " s)",
+             this->confirm_timeout_ms_ / 1000);
+  }
+#endif
   this->parent_->add_on_start_callback([this]() {
     esp_zigbee_lock_acquire(portMAX_DELAY);
     ezb_zcl_ota_upgrade_set_download_block_size(this->endpoint_, this->block_size_);
@@ -61,6 +75,10 @@ void ZigbeeOTAComponent::dump_config() {
 
 void ZigbeeOTAComponent::loop() {
   const uint32_t now = millis();
+#ifdef USE_ZIGBEE_OTA_CONFIRM
+  if (this->pending_confirm_)
+    this->confirm_loop_(now);
+#endif
 
   if (this->reboot_pending_.load()) {
     if (this->reboot_at_ms_ == 0) {
@@ -90,6 +108,41 @@ void ZigbeeOTAComponent::loop() {
   }
 }
 
+#ifdef USE_ZIGBEE_OTA_CONFIRM
+void ZigbeeOTAComponent::confirm_loop_(uint32_t now) {
+  if (this->server_answered_.load()) {
+    this->pending_confirm_ = false;
+    ESP_LOGI(TAG, "OTA server answered, new image confirmed");
+    this->safe_mode_->release_app_confirmation();
+  } else if (now - this->boot_ms_ > this->confirm_timeout_ms_) {
+    ESP_LOGE(TAG, "No answer from the OTA server within %" PRIu32 " s, rolling back", this->confirm_timeout_ms_ / 1000);
+    App.run_safe_shutdown_hooks();
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+  } else if (this->parent_->is_joined() &&
+             (this->last_query_ms_ == 0 || now - this->last_query_ms_ > CONFIRM_QUERY_MS)) {
+    this->last_query_ms_ = now;
+    this->send_query_();
+  }
+}
+
+void ZigbeeOTAComponent::send_query_() {
+  ezb_zcl_ota_upgrade_query_next_image_req_cmd_t req = {};
+  req.cmd_ctrl.dst_addr.addr_mode = EZB_ADDR_MODE_SHORT;
+  req.cmd_ctrl.dst_addr.u.short_addr = 0x0000;  // the coordinator
+  req.cmd_ctrl.dst_ep = 1;
+  req.cmd_ctrl.src_ep = this->endpoint_;
+  req.payload.fc = 0;
+  req.payload.manuf_code = this->manufacturer_code_;
+  req.payload.image_type = this->image_type_;
+  req.payload.file_version = this->file_version_;
+  if (!esp_zigbee_lock_acquire(10 / portTICK_PERIOD_MS))
+    return;
+  ezb_err_t err = ezb_zcl_ota_upgrade_query_next_image_cmd_req(&req);
+  esp_zigbee_lock_release();
+  ESP_LOGD(TAG, "Query Next Image sent (%d)", err);
+}
+#endif
+
 void ZigbeeOTAComponent::notify_(ota::OTAState state, float progress, uint8_t error) {
 #ifdef USE_OTA_STATE_LISTENER
   this->notify_state_deferred_(state, progress, error);
@@ -99,6 +152,10 @@ void ZigbeeOTAComponent::notify_(ota::OTAState state, float progress, uint8_t er
 void ZigbeeOTAComponent::on_ota_action(ezb_zcl_core_action_callback_id_t callback_id, void *message) {
   if (callback_id == EZB_ZCL_CORE_OTA_UPGRADE_QUERY_NEXT_IMAGE_RSP_CB_ID) {
     auto *msg = static_cast<ezb_zcl_ota_upgrade_query_next_image_rsp_message_t *>(message);
+#ifdef USE_ZIGBEE_OTA_CONFIRM
+    // Any answer, "no image" included, proves the round trip to the server.
+    this->server_answered_ = true;
+#endif
     if (msg->in.image.status == EZB_ZCL_OTA_UPGRADE_STATUS_CODE_SUCCESS) {
       ESP_LOGI(TAG, "Image offered: type 0x%04X, version 0x%08" PRIX32 ", %" PRIu32 " bytes", msg->in.image.image_type,
                msg->in.image.file_version, msg->in.image.size);
@@ -157,6 +214,10 @@ void ZigbeeOTAComponent::on_ota_action(ezb_zcl_core_action_callback_id_t callbac
 }
 
 ezb_zcl_status_t ZigbeeOTAComponent::on_start_(uint32_t file_size, uint32_t file_version) {
+#ifdef USE_ZIGBEE_OTA_CONFIRM
+  // An offer is an answer from the server too (and begin() below confirms the running image).
+  this->server_answered_ = true;
+#endif
   if (this->ended_.load() || this->reboot_pending_.load()) {
     // The other slot holds the image selected for the next boot.
     ESP_LOGW(TAG, "Offer refused, a new image waits for the reboot");

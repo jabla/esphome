@@ -11,6 +11,9 @@
 #include "esphome/components/zigbee/zigbee_esp32.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
+#ifdef USE_ZIGBEE_OTA_CONFIRM
+#include "esphome/components/safe_mode/safe_mode.h"
+#endif
 
 namespace esphome::zigbee {
 
@@ -29,6 +32,12 @@ class ZigbeeOTAComponent : public ota::OTAComponent, public ZigbeeOTAListener, p
   void set_endpoint(uint8_t endpoint) { this->endpoint_ = endpoint; }
   void set_block_size(uint8_t block_size) { this->block_size_ = block_size; }
   void set_file_version(uint32_t file_version) { this->file_version_ = file_version; }
+  void set_manufacturer_code(uint16_t manufacturer_code) { this->manufacturer_code_ = manufacturer_code; }
+  void set_image_type(uint16_t image_type) { this->image_type_ = image_type; }
+#ifdef USE_ZIGBEE_OTA_CONFIRM
+  void set_safe_mode(safe_mode::SafeModeComponent *safe_mode) { this->safe_mode_ = safe_mode; }
+  void set_confirm_timeout(uint32_t confirm_timeout_ms) { this->confirm_timeout_ms_ = confirm_timeout_ms; }
+#endif
 
   void on_ota_action(ezb_zcl_core_action_callback_id_t callback_id, void *message) override;
 
@@ -49,10 +58,27 @@ class ZigbeeOTAComponent : public ota::OTAComponent, public ZigbeeOTAListener, p
   void reset_upgrade_status_();
   void resync_file_offset_(uint32_t block_len);
   void notify_(ota::OTAState state, float progress, uint8_t error);
+#ifdef USE_ZIGBEE_OTA_CONFIRM
+  void confirm_loop_(uint32_t now);
+  void send_query_();
+#endif
 
   uint8_t endpoint_{1};
   uint8_t block_size_{223};
   uint32_t file_version_{0};
+  uint16_t manufacturer_code_{0};
+  uint16_t image_type_{0};
+#ifdef USE_ZIGBEE_OTA_CONFIRM
+  // A new image stays unconfirmed (bootloader rollback armed) until the OTA
+  // server answers: an image that boots but cannot reach the Zigbee network
+  // could not be updated again, so it rolls back after confirm_timeout_ms_.
+  safe_mode::SafeModeComponent *safe_mode_{nullptr};
+  uint32_t confirm_timeout_ms_{0};
+  uint32_t boot_ms_{0};
+  uint32_t last_query_ms_{0};
+  bool pending_confirm_{false};
+  std::atomic<bool> server_answered_{false};
+#endif
 
   // Zigbee task only.
   ota::OTABackendPtr backend_{nullptr};
