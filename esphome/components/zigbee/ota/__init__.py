@@ -6,6 +6,7 @@ The received image goes through the regular ESP-IDF OTA backend, so rollback
 and safe mode work as for the other OTA platforms.
 """
 
+import logging
 from pathlib import Path
 import time
 
@@ -13,7 +14,7 @@ import esphome.codegen as cg
 from esphome.components.esp32 import add_extra_build_file, add_src_cmake
 from esphome.components.ota import BASE_OTA_SCHEMA, OTAComponent, ota_to_code
 import esphome.config_validation as cv
-from esphome.const import CONF_ENDPOINT, CONF_ID
+from esphome.const import CONF_ADVANCED, CONF_ENDPOINT, CONF_FRAMEWORK, CONF_ID
 from esphome.core import CORE
 from esphome.coroutine import CoroPriority, coroutine_with_priority
 from esphome.types import ConfigType
@@ -21,6 +22,8 @@ from esphome.types import ConfigType
 from ..const import ZigbeeComponent
 from ..const_zephyr import CONF_ZIGBEE_ID
 from ..zigbee_ep_esp32 import get_first_ep_num
+
+_LOGGER = logging.getLogger(__name__)
 
 CODEOWNERS = ["@mmornati"]
 DEPENDENCIES = ["zigbee"]
@@ -96,6 +99,25 @@ async def to_code(config: ConfigType) -> None:
     ]
     if not config[CONF_COMPRESS]:
         args.append("--no-compress")
+    # With signed OTA verification the device only accepts a signed image.
+    # A key in the config signs <name>.bin before gen_project_binary ends, so
+    # the OTA file wraps the signed image. Signed outside the build, the image
+    # has to be wrapped again after signing.
+    advanced = (
+        CORE.config.get("esp32", {}).get(CONF_FRAMEWORK, {}).get(CONF_ADVANCED, {})
+    )
+    signed = advanced.get("signed_ota_verification")
+    if signed and "signing_key" not in signed:
+        _LOGGER.warning(
+            "Signed OTA verification without 'signing_key': %s holds the unsigned "
+            "image, which the device rejects. Sign <build>/%s.bin, then wrap it with "
+            "'python %s <signed .bin> %s %s'",
+            OTA_FILE_NAME,
+            CORE.name,
+            PACKER_SCRIPT,
+            OTA_FILE_NAME,
+            " ".join(args),
+        )
     add_src_cmake(
         f"""
 idf_build_get_property(_zb_ota_python PYTHON)
