@@ -69,6 +69,7 @@ class ZigbeeOTAComponent : public ota::OTAComponent, public ZigbeeOTAListener, p
   bool inflate_done_{false};
   bool failed_{false};
   uint8_t last_percent_{0};
+  uint8_t resyncs_{0};
 
   // Shared with the main loop.
   std::atomic<uint32_t> offset_{0};
