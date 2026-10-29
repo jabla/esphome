@@ -15,11 +15,12 @@ from esphome.components.esp32 import add_extra_build_file, add_src_cmake
 from esphome.components.ota import BASE_OTA_SCHEMA, OTAComponent, ota_to_code
 import esphome.config_validation as cv
 from esphome.const import CONF_ADVANCED, CONF_ENDPOINT, CONF_FRAMEWORK, CONF_ID
-from esphome.core import CORE
+from esphome.core import CORE, EsphomeError
 from esphome.coroutine import CoroPriority, coroutine_with_priority
 from esphome.types import ConfigType
 
-from ..const import ZigbeeComponent
+from ..const import KEY_ZIGBEE, ZigbeeComponent
+from ..const_esp32 import KEY_ZIGBEE_EP
 from ..const_zephyr import CONF_ZIGBEE_ID
 from ..zigbee_ep_esp32 import get_first_ep_num
 
@@ -88,6 +89,13 @@ async def to_code(config: ConfigType) -> None:
 
     file_version = config.get(CONF_FILE_VERSION, int(time.time()) & 0xFFFFFFFF)
     endpoint = config.get(CONF_ENDPOINT) or get_first_ep_num()
+    # The zigbee component numbers its endpoints in final validation, so the
+    # list is only complete here.
+    if endpoint not in CORE.data[KEY_ZIGBEE][KEY_ZIGBEE_EP]:
+        raise EsphomeError(
+            f"Zigbee OTA: endpoint {endpoint} does not exist. Leave out 'endpoint' "
+            "to use the first endpoint."
+        )
     cg.add(var.set_endpoint(endpoint))
     cg.add(var.set_block_size(config[CONF_BLOCK_SIZE]))
     cg.add(var.set_file_version(file_version))
