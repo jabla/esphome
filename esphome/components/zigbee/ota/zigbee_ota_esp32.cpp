@@ -17,7 +17,7 @@
 
 namespace esphome::zigbee {
 
-static const char *const TAG = "zigbee.ota";
+ESPHOME_LOG_TAG(TAG, "zigbee.ota");
 
 // OTA file layout (ZCL spec 11.4): a header whose length sits at offset 6, then
 // sub-elements of tag (2 bytes) + length (4 bytes) + data. The app image is in
@@ -412,8 +412,9 @@ void ZigbeeOTAComponent::on_abort_() {
     // The new image was already selected: boot the running one again.
     ESP_LOGW(TAG, "Update aborted after the image check");
     esp_err_t err = esp_ota_set_boot_partition(esp_ota_get_running_partition());
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
       ESP_LOGE(TAG, "Could not select the running image again: %s", esp_err_to_name(err));
+    }
     this->ended_ = false;
   }
   ESP_LOGW(TAG, "Update aborted at %" PRIu32 " bytes", this->offset_.load());
