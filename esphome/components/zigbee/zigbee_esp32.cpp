@@ -254,36 +254,6 @@ void ZigbeeComponent::add_cluster(uint8_t endpoint_id, uint16_t cluster_id, uint
   ESP_LOGD(TAG, "Endpoint %u: Added cluster 0x%04X with role %u", endpoint_id, cluster_id, role);
 }
 
-#ifdef USE_ZIGBEE_OTA
-void ZigbeeComponent::add_ota_client_cluster(uint8_t endpoint_id, uint16_t manufacturer_code, uint16_t image_type,
-                                             uint32_t file_version) {
-  ezb_af_ep_desc_t ep_desc = ezb_af_device_get_endpoint_desc(this->dev_desc_, endpoint_id);
-  if (ep_desc == NULL) {
-    ESP_LOGE(TAG, "Endpoint %u does not exist, cannot add the OTA Upgrade client cluster", endpoint_id);
-    return;
-  }
-  ezb_zcl_ota_upgrade_cluster_client_config_t client_cfg = {
-      .upgrade_server_id = EZB_ZCL_OTA_UPGRADE_UPGRADE_SERVER_ID_DEFAULT_VALUE,
-      .file_offset = 0,
-      .image_upgrade_status = EZB_ZCL_OTA_UPGRADE_IMAGE_UPGRADE_STATUS_DEFAULT_VALUE,
-      .manufacturer_id = manufacturer_code,
-      .image_type_id = image_type,
-  };
-  ezb_zcl_cluster_desc_t cluster_desc = ezb_zcl_ota_upgrade_create_cluster_desc(&client_cfg, EZB_ZCL_CLUSTER_CLIENT);
-  if (cluster_desc == NULL) {
-    ESP_LOGE(TAG, "Could not create the OTA Upgrade client cluster");
-    return;
-  }
-  // The attribute keeps a pointer to the value, so it must outlive the stack.
-  this->ota_file_version_ = file_version;
-  ezb_zcl_ota_upgrade_cluster_desc_add_attr(cluster_desc, EZB_ZCL_ATTR_OTA_UPGRADE_CURRENT_FILE_VERSION_ID,
-                                            &this->ota_file_version_);
-  if (ezb_af_endpoint_add_cluster_desc(ep_desc, cluster_desc) != EZB_ERR_NONE) {
-    ESP_LOGE(TAG, "Could not add the OTA Upgrade client cluster to endpoint %u", endpoint_id);
-  }
-}
-#endif
-
 void ZigbeeComponent::set_basic_cluster(const char *model, const char *manufacturer, const char *location,
                                         const char *sw_build_id, uint8_t power_source, uint8_t app_version) {
   char date_buf[16];
@@ -335,6 +305,16 @@ bool ZigbeeComponent::register_device() {
     this->mark_failed();
     return false;
   }
+#ifdef USE_ZIGBEE_OTA
+  // These look up the OTA client by endpoint, so only after registration; the stack is not running yet.
+  if (this->ota_endpoint_ != 0) {
+    ezb_err_t err = ezb_zcl_ota_upgrade_set_download_block_size(this->ota_endpoint_, this->ota_block_size_);
+    if (err == EZB_ERR_NONE)
+      err = ezb_zcl_ota_upgrade_set_download_retry(this->ota_endpoint_, this->ota_retries_, this->ota_retry_ms_);
+    if (err != EZB_ERR_NONE)
+      ESP_LOGE(TAG, "Could not set the OTA download settings (%d)", err);
+  }
+#endif
   return true;
 }
 
@@ -428,6 +408,8 @@ void ZigbeeComponent::setup() {
       .current_power_source_level = EZB_AF_NODE_POWER_SOURCE_LEVEL_100_PERCENT,
   };
   ezb_af_set_node_power_desc(&desc);
+  if (this->has_manufacturer_code_)
+    ezb_af_node_desc_set_manuf_code(this->manufacturer_code_);
 
   // Start the Zigbee task with priority 1 to ensure main loop can still run even if Zigbee is busy
   xTaskCreate(ezb_task, "Zigbee_main", 4096, NULL, 1, NULL);

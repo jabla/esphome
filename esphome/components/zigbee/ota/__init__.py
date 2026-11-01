@@ -20,22 +20,25 @@ from esphome.const import (
     CONF_ENDPOINT,
     CONF_FRAMEWORK,
     CONF_ID,
+    CONF_TYPE,
+    CONF_VALUE,
 )
-from esphome.core import CORE, EsphomeError
+from esphome.core import CORE
 from esphome.coroutine import CoroPriority, coroutine_with_priority
+import esphome.final_validate as fv
 from esphome.types import ConfigType
 
-from ..const import KEY_ZIGBEE, ZigbeeComponent
-from ..const_esp32 import KEY_ZIGBEE_EP
+from ..const import CONF_MANUFACTURER_CODE, KEY_ZIGBEE, ZigbeeComponent
+from ..const_esp32 import CONF_ATTRIBUTE_ID, CONF_ATTRIBUTES, CONF_CLUSTERS, ROLE
 from ..const_zephyr import CONF_ZIGBEE_ID
-from ..zigbee_ep_esp32 import get_first_ep_num
+from ..zigbee_ep_esp32 import add_clusters_to_first_ep, add_ep, get_first_ep_num
+from ..zigbee_esp32 import setup_attributes
 
 _LOGGER = logging.getLogger(__name__)
 
 CODEOWNERS = ["@mmornati"]
 DEPENDENCIES = ["zigbee"]
 
-CONF_MANUFACTURER_CODE = "manufacturer_code"
 CONF_IMAGE_TYPE = "image_type"
 CONF_FILE_VERSION = "file_version"
 CONF_BLOCK_SIZE = "block_size"
@@ -44,17 +47,65 @@ CONF_CONFIRM_TIMEOUT = "confirm_timeout"
 
 OTA_FILE_NAME = "firmware.zigbee.ota"
 PACKER_SCRIPT = "make_zigbee_ota.py"
+KEY_ZIGBEE_OTA_MANUFACTURER_ATTR = "zigbee_ota_manufacturer_attr"
+
+# OTA Upgrade client attributes (ZCL 11.10)
+ATTR_CURRENT_FILE_VERSION = 0x0002
+ATTR_MANUFACTURER_ID = 0x0007
+ATTR_IMAGE_TYPE_ID = 0x0008
+# The stack asks again for a block whose answer has not come within this time
+# (its default is 5 s, short for a server that answers a sleepy device through
+# its parent).
+BLOCK_RETRY_MS = 10000
+BLOCK_RETRIES = 3
 
 zigbee_ns = cg.esphome_ns.namespace("zigbee")
 ZigbeeOTAComponent = zigbee_ns.class_("ZigbeeOTAComponent", OTAComponent)
+
+
+def _validate_zigbee_ota(config: ConfigType) -> ConfigType:
+    # Fixed here so the cluster attribute and the OTA file always agree.
+    # Defaults to the build time, so every build is newer than the last.
+    if CONF_FILE_VERSION not in config:
+        config[CONF_FILE_VERSION] = int(time.time()) & 0xFFFFFFFF
+    manufacturer_attr = {
+        CONF_ATTRIBUTE_ID: ATTR_MANUFACTURER_ID,
+        CONF_TYPE: "UINT16",
+        CONF_VALUE: 0,  # set in _final_validate
+    }
+    cl = {
+        CONF_ID: "OTA_UPGRADE",
+        ROLE: "CLIENT",
+        CONF_ATTRIBUTES: [
+            {
+                CONF_ATTRIBUTE_ID: ATTR_CURRENT_FILE_VERSION,
+                CONF_TYPE: "UINT32",
+                CONF_VALUE: config[CONF_FILE_VERSION],
+            },
+            manufacturer_attr,
+            {
+                CONF_ATTRIBUTE_ID: ATTR_IMAGE_TYPE_ID,
+                CONF_TYPE: "UINT16",
+                CONF_VALUE: config[CONF_IMAGE_TYPE],
+            },
+        ],
+    }
+    setup_attributes(config, [cl])
+    CORE.data.setdefault(KEY_ZIGBEE, {})[KEY_ZIGBEE_OTA_MANUFACTURER_ATTR] = (
+        manufacturer_attr
+    )
+    if (endpoint := config.get(CONF_ENDPOINT)) is None:
+        add_clusters_to_first_ep([cl])
+    else:
+        add_ep({CONF_CLUSTERS: [cl]}, endpoint, None)
+    return config
+
 
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(ZigbeeOTAComponent),
             cv.GenerateID(CONF_ZIGBEE_ID): cv.use_id(ZigbeeComponent),
-            # Espressif's manufacturer code, used by the esp-zigbee-sdk examples.
-            cv.Optional(CONF_MANUFACTURER_CODE, default=0x131B): cv.hex_uint16_t,
             # The server offers a file to every device with the same manufacturer
             # code and image type: give each kind of device its own.
             cv.Required(CONF_IMAGE_TYPE): cv.hex_uint16_t,
@@ -69,10 +120,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_BLOCK_SIZE, default=50): cv.int_range(min=16, max=254),
             # zlib-compress the image in the OTA file (about 60 % of the size).
             cv.Optional(CONF_COMPRESS, default=True): cv.boolean,
-            # A new image is confirmed only once the coordinator is heard (any
-            # frame from it, or an answer to Query Next Image); without that in
-            # this time the bootloader rolls back to the previous image. 0s, or
-            # a build without OTA rollback, leaves it to safe_mode alone.
+            # A new image is confirmed only once the device has joined the
+            # network again; without that in this time the bootloader rolls back
+            # to the previous image. 0s, or a build without OTA rollback, leaves
+            # it to safe_mode alone.
             cv.Optional(
                 CONF_CONFIRM_TIMEOUT, default="10min"
             ): cv.positive_time_period_milliseconds,
@@ -81,7 +132,22 @@ CONFIG_SCHEMA = cv.All(
     .extend(BASE_OTA_SCHEMA)
     .extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
+    _validate_zigbee_ota,
 )
+
+
+def _final_validate(config: ConfigType) -> ConfigType:
+    # The manufacturer code is set on the zigbee component; its config is only
+    # known here. The attribute dict is shared with the endpoint list, which the
+    # zigbee component turns into code.
+    zb_conf = fv.full_config.get().get(KEY_ZIGBEE, {})
+    CORE.data[KEY_ZIGBEE][KEY_ZIGBEE_OTA_MANUFACTURER_ATTR][CONF_VALUE] = zb_conf.get(
+        CONF_MANUFACTURER_CODE, 0
+    )
+    return config
+
+
+FINAL_VALIDATE_SCHEMA = _final_validate
 
 
 @coroutine_with_priority(CoroPriority.OTA_UPDATES)
@@ -93,20 +159,19 @@ async def to_code(config: ConfigType) -> None:
     zb = await cg.get_variable(config[CONF_ZIGBEE_ID])
     cg.add(var.set_parent(zb))
 
-    file_version = config.get(CONF_FILE_VERSION, int(time.time()) & 0xFFFFFFFF)
+    file_version = config[CONF_FILE_VERSION]
+    manufacturer_code = CORE.data[KEY_ZIGBEE][KEY_ZIGBEE_OTA_MANUFACTURER_ATTR][
+        CONF_VALUE
+    ]
+    # The zigbee component numbers its endpoints in final validation.
     endpoint = config.get(CONF_ENDPOINT) or get_first_ep_num()
-    # The zigbee component numbers its endpoints in final validation, so the
-    # list is only complete here.
-    if endpoint not in CORE.data[KEY_ZIGBEE][KEY_ZIGBEE_EP]:
-        raise EsphomeError(
-            f"Zigbee OTA: endpoint {endpoint} does not exist. Leave out 'endpoint' "
-            "to use the first endpoint."
-        )
     cg.add(var.set_endpoint(endpoint))
-    cg.add(var.set_block_size(config[CONF_BLOCK_SIZE]))
     cg.add(var.set_file_version(file_version))
-    cg.add(var.set_manufacturer_code(config[CONF_MANUFACTURER_CODE]))
-    cg.add(var.set_image_type(config[CONF_IMAGE_TYPE]))
+    cg.add(
+        zb.set_ota_download(
+            endpoint, config[CONF_BLOCK_SIZE], BLOCK_RETRIES, BLOCK_RETRY_MS
+        )
+    )
     advanced = (
         CORE.config.get("esp32", {}).get(CONF_FRAMEWORK, {}).get(CONF_ADVANCED, {})
     )
@@ -121,19 +186,11 @@ async def to_code(config: ConfigType) -> None:
         cg.add_define("USE_ZIGBEE_OTA_CONFIRM")
         cg.add(var.set_safe_mode(await cg.get_variable(safe_mode_conf[CONF_ID])))
         cg.add(var.set_confirm_timeout(config[CONF_CONFIRM_TIMEOUT]))
-    CORE.add_job(
-        _add_cluster,
-        zb,
-        endpoint,
-        config[CONF_MANUFACTURER_CODE],
-        config[CONF_IMAGE_TYPE],
-        file_version,
-    )
 
     # Wrap the app image into a Zigbee OTA file after every build.
     add_extra_build_file(PACKER_SCRIPT, Path(__file__).parent / PACKER_SCRIPT)
     args = [
-        f"--manufacturer-code {config[CONF_MANUFACTURER_CODE]}",
+        f"--manufacturer-code {manufacturer_code}",
         f"--image-type {config[CONF_IMAGE_TYPE]}",
         f"--file-version {file_version}",
         f'--header-string "{CORE.name[:32]}"',
@@ -171,13 +228,4 @@ add_custom_target(zigbee_ota_file ALL
     VERBATIM)
 add_dependencies(zigbee_ota_file gen_project_binary)
 """
-    )
-
-
-# The cluster goes onto an endpoint created by the zigbee component's code,
-# so it is added after that and before the Zigbee stack starts in setup().
-@coroutine_with_priority(CoroPriority.LATE)
-async def _add_cluster(zb, endpoint, manufacturer_code, image_type, file_version):
-    cg.add(
-        zb.add_ota_client_cluster(endpoint, manufacturer_code, image_type, file_version)
     )

@@ -68,10 +68,19 @@ class ZigbeeComponent final : public Component {
   void factory_reset();
   void report();
 
+  void set_manufacturer_code(uint16_t manufacturer_code) {
+    this->manufacturer_code_ = manufacturer_code;
+    this->has_manufacturer_code_ = true;
+  }
+
 #ifdef USE_ZIGBEE_OTA
-  /// Adds the OTA Upgrade client cluster to an endpoint. Must be called before setup().
-  void add_ota_client_cluster(uint8_t endpoint_id, uint16_t manufacturer_code, uint16_t image_type,
-                              uint32_t file_version);
+  /// Download settings of the OTA Upgrade client on `endpoint_id`, applied once the endpoints are registered.
+  void set_ota_download(uint8_t endpoint_id, uint8_t block_size, uint8_t retries, uint32_t retry_ms) {
+    this->ota_endpoint_ = endpoint_id;
+    this->ota_block_size_ = block_size;
+    this->ota_retries_ = retries;
+    this->ota_retry_ms_ = retry_ms;
+  }
   void set_ota_listener(ZigbeeOTAListener *listener) { this->ota_listener_ = listener; }
   ZigbeeOTAListener *get_ota_listener() const { return this->ota_listener_; }
 #endif
@@ -92,8 +101,13 @@ class ZigbeeComponent final : public Component {
   bool sleepy_{false};
 #ifdef USE_ZIGBEE_OTA
   ZigbeeOTAListener *ota_listener_{nullptr};
-  uint32_t ota_file_version_{0};
+  uint32_t ota_retry_ms_{0};
+  uint8_t ota_endpoint_{0};
+  uint8_t ota_block_size_{0};
+  uint8_t ota_retries_{0};
 #endif
+  uint16_t manufacturer_code_{0};
+  bool has_manufacturer_code_{false};
   uint32_t keep_alive_{3000};
   struct {
     uint8_t *model;
