@@ -40,10 +40,6 @@ class ZigbeeOTAComponent : public ota::OTAComponent, public ZigbeeOTAListener, p
 #endif
 
   void on_ota_action(ezb_zcl_core_action_callback_id_t callback_id, void *message) override;
-#ifdef USE_ZIGBEE_OTA_CONFIRM
-  /// A frame from the coordinator arrived (Zigbee task).
-  void on_coordinator_frame() { this->server_answered_ = true; }
-#endif
 
  protected:
   enum class ImageFormat : uint8_t { NONE, RAW, ZLIB };
@@ -68,8 +64,7 @@ class ZigbeeOTAComponent : public ota::OTAComponent, public ZigbeeOTAListener, p
   void resync_file_offset_(uint32_t block_len);
   void notify_(ota::OTAState state, float progress, uint8_t error);
 #ifdef USE_ZIGBEE_OTA_CONFIRM
-  void confirm_loop_(uint32_t now);
-  void send_query_();
+  void confirm_image_();
 #endif
 
   uint8_t endpoint_{1};
@@ -79,15 +74,11 @@ class ZigbeeOTAComponent : public ota::OTAComponent, public ZigbeeOTAListener, p
   uint16_t image_type_{0};
 #ifdef USE_ZIGBEE_OTA_CONFIRM
   // A new image stays unconfirmed (bootloader rollback armed) until the
-  // coordinator is heard (any frame from it, or an answer to Query Next
-  // Image): an image that boots but cannot reach the Zigbee network
-  // could not be updated again, so it rolls back after confirm_timeout_ms_.
+  // device has joined the network again: an image that boots but cannot
+  // reach the Zigbee network could not be updated again, so it rolls back
+  // after confirm_timeout_ms_.
   safe_mode::SafeModeComponent *safe_mode_{nullptr};
   uint32_t confirm_timeout_ms_{0};
-  uint32_t boot_ms_{0};
-  uint32_t last_query_ms_{0};
-  bool pending_confirm_{false};
-  std::atomic<bool> server_answered_{false};
 #endif
 
   // Zigbee task only.

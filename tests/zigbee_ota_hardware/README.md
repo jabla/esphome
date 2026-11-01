@@ -84,9 +84,9 @@ client cluster. It offers the image files in a folder.
    the ZHA integration afterwards. If the update entity still shows no new version, call
    `homeassistant.update_entity` on it, which makes ZHA check at once.
 5. **Press Install** on the update entity, or call `update.install`. The serial log shows the
-   same lines as in step 5 above. After the reboot the device sends Query Next Image, which ZHA
-   answers at once, so `Coordinator reached, new image confirmed` follows within a second. ZHA
-   then reads the new file version and interviews the device again by itself.
+   same lines as in step 5 above. After the reboot the device joins the network again, and
+   `Network joined, new image confirmed` follows in the same second. ZHA then reads the new file
+   version and interviews the device again by itself.
 
 zigpy sends at most 50 bytes per block, whatever `block_size` asks for, but answers each block at
 once: a 356 KB file took about 10 minutes on an ESP32-H2 router with a strong link, 11 to 13
@@ -102,6 +102,12 @@ The server does not see this rollback: the device sent a successful Upgrade End 
 rebooted. ZHA reports the update as successful, then reads the old file version from the device
 again and offers the crashing image once more, so remove it from the folder.
 
+For an image that boots but cannot reach the network, build a version with
+`confirm_timeout: 2min` whose radio cannot work, for example a XIAO ESP32-C6 config that drives
+GPIO3 high (RF switch off). Its rejoin fails with status 0x03 (no network), `safe_mode` passes
+its 60 s without confirming the image, then `Network not joined within 120 s, rolling back`
+follows and the bootloader starts the previous version.
+
 ## Results with ZHA
 
 ESP32-H2 router without BLE and XIAO ESP32-C6 router, Home Assistant 2026.10 with a ConBee III
@@ -112,7 +118,8 @@ coordinator. The H2 ran `zigbee-ota-test.yaml` with `variant: esp32h2` and
 |---|---|
 | Update, zlib image of 356 KB, H2 alone | 10 minutes, no skipped blocks, back on the network 1 s after the reboot |
 | Update of both at the same time, 356 KB (H2) and 365 KB (C6) | 13 and 11 minutes, no skipped blocks |
-| Confirmation after the reboot | Query Next Image answered at once, image confirmed within a second |
+| Confirmation after the reboot | image confirmed at the rejoin, in the same second as the reboot; safe_mode still waits its 60 s (a reset before that rolls back) |
+| New image that cannot join (C6, RF switch off, TI CC2652 coordinator) | no network on every rejoin attempt, rolled back after `confirm_timeout` |
 | Free heap while inflating | lowest 139 KB of 184 KB on the H2, 335 KB of 380 KB on the C6 |
 | Index in the Z2M format from a URL | update offered and installed |
 | Rollback check | crashing image installed over ZHA, the second version ran again from the next boot on |
