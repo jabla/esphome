@@ -69,7 +69,8 @@ void ZigbeeOTAComponent::setup() {
     this->set_timeout(CONFIRM_TIMEOUT_ID, this->confirm_timeout_ms_, [this]() {
       ESP_LOGE(TAG, "Not joined within %" PRIu32 " s, rolling back", this->confirm_timeout_ms_ / 1000);
       App.run_safe_shutdown_hooks();
-      esp_ota_mark_app_invalid_rollback_and_reboot();
+      // Returns only when the rollback failed.
+      ESP_LOGE(TAG, "Rollback failed: %s", esp_err_to_name(esp_ota_mark_app_invalid_rollback_and_reboot()));
     });
     this->parent_->add_on_join_callback([this](bool /*factory_new*/) { this->confirm_image_(); });
     if (this->parent_->is_joined())
