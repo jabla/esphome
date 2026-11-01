@@ -105,8 +105,8 @@ again and offers the crashing image once more, so remove it from the folder.
 ## Results with ZHA
 
 ESP32-H2 router without BLE and XIAO ESP32-C6 router, Home Assistant 2026.10 with a ConBee III
-coordinator. The H2 ran `zigbee-ota-test.yaml` with `variant: esp32h2` and
-`board: esp32-h2-devkitm-1`:
+coordinator. The H2 ran `zigbee-ota-test.yaml` with `variant: esp32h2`,
+`board: esp32-h2-devkitm-1` and without the XIAO's RF switch outputs:
 
 | Check | Result |
 |---|---|
