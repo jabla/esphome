@@ -12,6 +12,16 @@ esp32:
   framework:
     type: esp-idf
 
+# XIAO ESP32-C6 RF switch: GPIO3 LOW powers it, GPIO14 LOW selects the internal
+# antenna. Without them the radio is much weaker. Remove both for other boards.
+output:
+  - platform: gpio
+    pin: GPIO3
+    id: rf_switch_en
+  - platform: gpio
+    pin: GPIO14
+    id: rf_ant_select
+
 logger:
   hardware_uart: USB_SERIAL_JTAG
 
