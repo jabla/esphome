@@ -7,17 +7,22 @@
 
 #include "esp_ota_ops.h"
 #include "esp_zigbee.h"
-#include "ezbee/aps.h"
 #include "ezbee/zcl/cluster/ota_upgrade.h"
 #include "miniz.h"
 
 #include "esphome/core/application.h"
-#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
 namespace esphome::zigbee {
 
 ESPHOME_LOG_TAG(TAG, "zigbee.ota");
+
+// Threading: the stack's OTA callbacks (on_ota_action) run on the Zigbee task and
+// must stay there, as the block buffer is only valid during the callback and the
+// stack wants the result synchronously. State the main loop reads is atomic; the
+// backend and parser state are only touched on the Zigbee task, except for the
+// stall abort, which takes the stack's lock and checks again. The main loop is
+// woken with enable_loop_soon_any_context() and otherwise stays disabled.
 
 // OTA file layout (ZCL spec 11.4): a header whose length sits at offset 6, then
 // sub-elements of tag (2 bytes) + length (4 bytes) + data. The app image is in
@@ -28,11 +33,6 @@ static constexpr uint16_t TAG_UPGRADE_IMAGE = 0x0000;
 static constexpr uint16_t TAG_IMAGE_ZLIB = 0xF100;
 static constexpr uint8_t SUB_ELEMENT_HEADER_LEN = 6;
 static constexpr uint32_t MIN_HEADER_LEN = 56;
-// The stack asks again for a block whose answer has not come within this time
-// (its default is 5 s, short for a server that answers a sleepy device through
-// its parent).
-static constexpr uint32_t BLOCK_RETRY_MS = 10000;
-static constexpr uint8_t BLOCK_RETRIES = 3;
 // Without a block for this long the server has walked away. The stack does not
 // always report that (a block response with an error status ends it silently).
 static constexpr uint32_t STALL_MS = 60000;
@@ -40,24 +40,11 @@ static constexpr uint32_t REBOOT_DELAY_MIN_MS = 2000;
 static constexpr uint32_t REBOOT_DELAY_MAX_S = 86400;
 // Out-of-place blocks in a row tolerated before giving up.
 static constexpr uint8_t MAX_RESYNCS = 50;
-// While a new image waits for confirmation, ask the server this often.
-static constexpr uint32_t CONFIRM_QUERY_MS = 30000;
 
+static constexpr uint32_t STALL_INTERVAL_ID = 0;
+static constexpr uint32_t REBOOT_TIMEOUT_ID = 1;
 #ifdef USE_ZIGBEE_OTA_CONFIRM
-static ZigbeeOTAComponent *pending_confirm_instance = nullptr;  // NOLINT
-
-// Any frame from the coordinator proves the new image reaches the network:
-// Zigbee2MQTT re-interviews a device right after the announce that follows an
-// update, but answers Query Next Image only once per update_check_interval (a
-// day by default), so its answer alone is not enough. On the Zigbee task;
-// never consumes the frame.
-static bool on_aps_indication(const ezb_apsde_data_ind_t *ind) {
-  if (pending_confirm_instance != nullptr && ind->status == 0 && ind->src_address.addr_mode == EZB_ADDR_MODE_SHORT &&
-      ind->src_address.u.short_addr == 0x0000) {
-    pending_confirm_instance->on_coordinator_frame();
-  }
-  return false;
-}
+static constexpr uint32_t CONFIRM_TIMEOUT_ID = 2;
 #endif
 
 struct ZigbeeOTAComponent::Inflater {
@@ -75,106 +62,84 @@ void ZigbeeOTAComponent::setup() {
   if (this->safe_mode_ != nullptr && this->confirm_timeout_ms_ > 0 &&
       esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
       state == ESP_OTA_IMG_PENDING_VERIFY) {
+    // An image that boots but cannot rejoin the network could not be updated
+    // again: keep it unconfirmed (rollback armed) until the device has joined.
     this->safe_mode_->hold_app_confirmation();
-    this->pending_confirm_ = true;
-    this->boot_ms_ = millis();
-    ESP_LOGI(TAG, "New image, confirmed once the coordinator is heard (rollback after %" PRIu32 " s)",
-             this->confirm_timeout_ms_ / 1000);
+    ESP_LOGI(TAG, "New image, confirmed once joined (rollback after %" PRIu32 " s)", this->confirm_timeout_ms_ / 1000);
+    this->set_timeout(CONFIRM_TIMEOUT_ID, this->confirm_timeout_ms_, [this]() {
+      ESP_LOGE(TAG, "Not joined within %" PRIu32 " s, rolling back", this->confirm_timeout_ms_ / 1000);
+      App.run_safe_shutdown_hooks();
+      esp_ota_mark_app_invalid_rollback_and_reboot();
+    });
+    this->parent_->add_on_join_callback([this](bool /*factory_new*/) { this->confirm_image_(); });
+    if (this->parent_->is_joined())
+      this->confirm_image_();
   }
 #endif
-  this->parent_->add_on_start_callback([this]() {
-    esp_zigbee_lock_acquire(portMAX_DELAY);
-    ezb_zcl_ota_upgrade_set_download_block_size(this->endpoint_, this->block_size_);
-    ezb_zcl_ota_upgrade_set_download_retry(this->endpoint_, BLOCK_RETRIES, BLOCK_RETRY_MS);
-#ifdef USE_ZIGBEE_OTA_CONFIRM
-    if (this->pending_confirm_) {
-      pending_confirm_instance = this;
-      ezb_apsde_data_indication_handler_register(on_aps_indication);
-    }
-#endif
-    esp_zigbee_lock_release();
-  });
+  this->disable_loop();
 }
+
+#ifdef USE_ZIGBEE_OTA_CONFIRM
+void ZigbeeOTAComponent::confirm_image_() {
+  if (this->cancel_timeout(CONFIRM_TIMEOUT_ID)) {
+    ESP_LOGI(TAG, "Joined, new image confirmed");
+    this->safe_mode_->release_app_confirmation();
+  }
+}
+#endif
 
 void ZigbeeOTAComponent::dump_config() {
   ESP_LOGCONFIG(TAG,
                 "Over-The-Air updates via Zigbee:\n"
                 "  Endpoint: %u\n"
-                "  File version: 0x%08" PRIX32 "\n"
-                "  Block size: %u",
-                this->endpoint_, this->file_version_, this->block_size_);
+                "  File version: 0x%08" PRIX32,
+                this->endpoint_, this->file_version_);
 }
 
 void ZigbeeOTAComponent::loop() {
-  const uint32_t now = millis();
-#ifdef USE_ZIGBEE_OTA_CONFIRM
-  if (this->pending_confirm_)
-    this->confirm_loop_(now);
-#endif
-
+  // Woken by the Zigbee task when a download starts or the update is complete.
   if (this->reboot_pending_.load()) {
-    if (this->reboot_at_ms_ == 0) {
+    if (!this->reboot_scheduled_) {
+      this->reboot_scheduled_ = true;
+      this->cancel_interval(STALL_INTERVAL_ID);
+      this->stall_armed_ = false;
       const uint32_t delay_ms = std::max(this->reboot_delay_ms_.load(), REBOOT_DELAY_MIN_MS);
-      this->reboot_at_ms_ = now + delay_ms;
       ESP_LOGI(TAG, "Rebooting into the new firmware in %" PRIu32 " ms", delay_ms);
-    } else if (static_cast<int32_t>(now - this->reboot_at_ms_) >= 0) {
-      App.safe_reboot();
+      this->set_timeout(REBOOT_TIMEOUT_ID, delay_ms, []() { App.safe_reboot(); });
     }
+  } else if (this->downloading_.load() && !this->stall_armed_) {
+    this->stall_armed_ = true;
+    this->last_blocks_ = this->blocks_.load();
+    this->set_interval(STALL_INTERVAL_ID, STALL_MS, [this]() { this->check_stall_(); });
+  }
+  this->disable_loop();
+}
+
+void ZigbeeOTAComponent::check_stall_() {
+  if (!this->downloading_.load()) {
+    this->cancel_interval(STALL_INTERVAL_ID);
+    this->stall_armed_ = false;
     return;
   }
-
-  // Signed: the Zigbee task may store a block's time after `now` was taken.
-  const bool stalled = this->downloading_.load() &&
-                       static_cast<int32_t>(now - this->last_progress_ms_.load()) > static_cast<int32_t>(STALL_MS);
-  if (stalled && esp_zigbee_lock_acquire(10 / portTICK_PERIOD_MS)) {
-    // Checked again under the stack's lock, where no block can come in between.
-    if (this->downloading_.load()) {
-      ESP_LOGE(TAG, "No block for %" PRIu32 " s, download abandoned at %" PRIu32 " bytes", STALL_MS / 1000,
-               this->offset_.load());
-      this->end_download_();
-      // The stack refuses later offers while it thinks a download runs.
-      this->reset_upgrade_status_();
-      this->notify_(ota::OTA_ERROR, 0.0f, static_cast<uint8_t>(ota::OTA_RESPONSE_ERROR_UNKNOWN));
-    }
-    esp_zigbee_lock_release();
+  const uint32_t blocks = this->blocks_.load();
+  if (blocks != this->last_blocks_) {
+    this->last_blocks_ = blocks;
+    return;
   }
-}
-
-#ifdef USE_ZIGBEE_OTA_CONFIRM
-void ZigbeeOTAComponent::confirm_loop_(uint32_t now) {
-  if (this->server_answered_.load()) {
-    this->pending_confirm_ = false;
-    pending_confirm_instance = nullptr;
-    ESP_LOGI(TAG, "Coordinator reached, new image confirmed");
-    this->safe_mode_->release_app_confirmation();
-  } else if (now - this->boot_ms_ > this->confirm_timeout_ms_) {
-    ESP_LOGE(TAG, "Nothing from the coordinator within %" PRIu32 " s, rolling back", this->confirm_timeout_ms_ / 1000);
-    App.run_safe_shutdown_hooks();
-    esp_ota_mark_app_invalid_rollback_and_reboot();
-  } else if (this->parent_->is_joined() &&
-             (this->last_query_ms_ == 0 || now - this->last_query_ms_ > CONFIRM_QUERY_MS)) {
-    this->last_query_ms_ = now;
-    this->send_query_();
-  }
-}
-
-void ZigbeeOTAComponent::send_query_() {
-  ezb_zcl_ota_upgrade_query_next_image_req_cmd_t req = {};
-  req.cmd_ctrl.dst_addr.addr_mode = EZB_ADDR_MODE_SHORT;
-  req.cmd_ctrl.dst_addr.u.short_addr = 0x0000;  // the coordinator
-  req.cmd_ctrl.dst_ep = 1;
-  req.cmd_ctrl.src_ep = this->endpoint_;
-  req.payload.fc = 0;
-  req.payload.manuf_code = this->manufacturer_code_;
-  req.payload.image_type = this->image_type_;
-  req.payload.file_version = this->file_version_;
+  // No block since the last check. Checked again under the stack's lock, where
+  // no block can come in between; if the lock is busy, the next check retries.
   if (!esp_zigbee_lock_acquire(10 / portTICK_PERIOD_MS))
     return;
-  ezb_err_t err = ezb_zcl_ota_upgrade_query_next_image_cmd_req(&req);
+  if (this->downloading_.load() && this->blocks_.load() == blocks) {
+    ESP_LOGE(TAG, "No block for %" PRIu32 " s, download abandoned at %" PRIu32 " bytes", STALL_MS / 1000,
+             this->offset_.load());
+    this->end_download_();
+    // The stack refuses later offers while it thinks a download runs.
+    this->reset_upgrade_status_();
+    this->notify_(ota::OTA_ERROR, 0.0f, static_cast<uint8_t>(ota::OTA_RESPONSE_ERROR_UNKNOWN));
+  }
   esp_zigbee_lock_release();
-  ESP_LOGD(TAG, "Query Next Image sent (%d)", err);
 }
-#endif
 
 void ZigbeeOTAComponent::notify_(ota::OTAState state, float progress, uint8_t error) {
 #ifdef USE_OTA_STATE_LISTENER
@@ -185,10 +150,6 @@ void ZigbeeOTAComponent::notify_(ota::OTAState state, float progress, uint8_t er
 void ZigbeeOTAComponent::on_ota_action(ezb_zcl_core_action_callback_id_t callback_id, void *message) {
   if (callback_id == EZB_ZCL_CORE_OTA_UPGRADE_QUERY_NEXT_IMAGE_RSP_CB_ID) {
     auto *msg = static_cast<ezb_zcl_ota_upgrade_query_next_image_rsp_message_t *>(message);
-#ifdef USE_ZIGBEE_OTA_CONFIRM
-    // Any answer, "no image" included, proves the round trip to the server.
-    this->server_answered_ = true;
-#endif
     if (msg->in.image.status == EZB_ZCL_OTA_UPGRADE_STATUS_CODE_SUCCESS) {
       ESP_LOGI(TAG, "Image offered: type 0x%04X, version 0x%08" PRIX32 ", %" PRIu32 " bytes", msg->in.image.image_type,
                msg->in.image.file_version, msg->in.image.size);
@@ -203,7 +164,7 @@ void ZigbeeOTAComponent::on_ota_action(ezb_zcl_core_action_callback_id_t callbac
 
   auto *msg = static_cast<ezb_zcl_ota_upgrade_client_progress_message_t *>(message);
   ezb_zcl_status_t result = EZB_ZCL_STATUS_SUCCESS;
-  this->last_progress_ms_ = millis();
+  this->blocks_.fetch_add(1);
 
   switch (msg->in.progress) {
     case EZB_ZCL_OTA_UPGRADE_PROGRESS_START:
@@ -234,7 +195,7 @@ void ZigbeeOTAComponent::on_ota_action(ezb_zcl_core_action_callback_id_t callbac
         this->reboot_delay_ms_ = std::min(delay_s, REBOOT_DELAY_MAX_S) * 1000;
       this->notify_(ota::OTA_COMPLETED, 100.0f, 0);
       this->reboot_pending_ = true;
-      App.wake_loop_threadsafe();
+      this->enable_loop_soon_any_context();
       break;
     }
     case EZB_ZCL_OTA_UPGRADE_PROGRESS_ABORT:
@@ -247,10 +208,6 @@ void ZigbeeOTAComponent::on_ota_action(ezb_zcl_core_action_callback_id_t callbac
 }
 
 ezb_zcl_status_t ZigbeeOTAComponent::on_start_(uint32_t file_size, uint32_t file_version) {
-#ifdef USE_ZIGBEE_OTA_CONFIRM
-  // An offer is an answer from the server too (and begin() below confirms the running image).
-  this->server_answered_ = true;
-#endif
   if (this->ended_.load() || this->reboot_pending_.load()) {
     // The other slot holds the image selected for the next boot.
     ESP_LOGW(TAG, "Offer refused, a new image waits for the reboot");
@@ -279,6 +236,7 @@ ezb_zcl_status_t ZigbeeOTAComponent::on_start_(uint32_t file_size, uint32_t file
     return EZB_ZCL_STATUS_ABORT;
   }
   this->downloading_ = true;
+  this->enable_loop_soon_any_context();  // arms the stall check
   this->notify_(ota::OTA_STARTED, 0.0f, 0);
   return EZB_ZCL_STATUS_SUCCESS;
 }

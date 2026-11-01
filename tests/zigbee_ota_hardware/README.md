@@ -84,9 +84,9 @@ client cluster. It offers the image files in a folder.
    the ZHA integration afterwards. If the update entity still shows no new version, call
    `homeassistant.update_entity` on it, which makes ZHA check at once.
 5. **Press Install** on the update entity, or call `update.install`. The serial log shows the
-   same lines as in step 5 above. After the reboot the device sends Query Next Image, which ZHA
-   answers at once, so `Coordinator reached, new image confirmed` follows within a second. ZHA
-   then reads the new file version and interviews the device again by itself.
+   same lines as in step 5 above. After the reboot the device rejoins the network, so
+   `Joined, new image confirmed` follows within a second. ZHA then reads the new file version and
+   interviews the device again by itself.
 
 zigpy sends at most 50 bytes per block, whatever `block_size` asks for, but answers each block at
 once: a 356 KB file took about 10 minutes on an ESP32-H2 router with a strong link, 11 to 13
